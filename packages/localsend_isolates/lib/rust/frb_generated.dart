@@ -214,7 +214,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiServerRsHttpServerRespondPrepareDownload({required RsHttpServer that, required String sessionId, required bool accept});
 
-  Future<void> crateApiServerRsHttpServerRespondPrepareUpload({required RsHttpServer that, List<String>? acceptedFileIds});
+  Future<void> crateApiServerRsHttpServerRespondPrepareUpload({required RsHttpServer that, List<String>? acceptedFileIds, List<String>? resumeOffers});
 
   Future<void> crateApiServerRsHttpServerStop({required RsHttpServer that});
 
