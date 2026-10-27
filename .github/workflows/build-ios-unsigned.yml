@@ -51,7 +51,9 @@ concurrency:
 jobs:
   build-ipa:
     name: macOS runner → unsigned IPA
-    runs-on: macos-14
+    # Xcode 26（iOS 26 SDK）：connectivity_plus 7.x 用了 NWPath.isUltraConstrained，
+    # Xcode 15/16 的 SDK 里没有这个成员，编译必失败。
+    runs-on: macos-26
     timeout-minutes: 120
 
     steps:
