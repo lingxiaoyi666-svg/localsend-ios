@@ -1,0 +1,283 @@
+# =============================================================================
+#  LocalSend → 未签名 IPA（Windows 无 Mac 方案）
+#
+#  放置位置：<你的 fork>/.github/workflows/build-ios-unsigned.yml
+#  触发方式：仓库页面 → Actions → “Build iOS IPA (unsigned)” → Run workflow
+#  产物：     Actions 运行页底部 artifact → LocalSend-<版本>-unsigned.ipa
+#
+#  设计要点：
+#   * macos-14（Apple Silicon）runner，按 10 倍额度计费，单次约 15–30 分钟。
+#   * 全程 --no-codesign，产物里不得出现任何 provisioning profile / _CodeSignature。
+#   * Rust 目标由 cargokit 在 pod 阶段调用 cargo 编译；这里提前装好
+#     aarch64-apple-ios / x86_64-apple-ios，失败时会话日志能一眼定位。
+#   * IPA 手工组包：Payload/ + Runner.app，用 zip -r**y** 保留 symlink。
+#   * 任何一步失败都不会产出“看起来能装”的包：结构断言在打包步骤里。
+# =============================================================================
+name: Build iOS IPA (unsigned)
+
+"on":
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Bundle ID（留空=org.localsend.localsendApp；ShareExtension 自动改成 <bundle_id>.ShareExtension）'
+        required: false
+        default: ''
+      app_name:
+        description: '主屏显示名（留空=LocalSend）'
+        required: false
+        default: ''
+      strip_entitlements:
+        description: '删掉 AppGroup / multicast / aps 三项受限权限（免费证书重签时打开）'
+        required: false
+        type: boolean
+        default: false
+      strip_share_extension:
+        description: '从 IPA 里删掉 ShareExtension.appex（重签报 appex 签名失败时打开）'
+        required: false
+        type: boolean
+        default: false
+      flutter_version:
+        description: 'Flutter 版本（留空=读仓库根目录 .fvmrc）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: macOS runner → unsigned IPA
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout (不拉 support/submodules/flutter)
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: 环境自检
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu | sed 's/^/CPU 核数: /'
+          df -h / | tail -1
+          (xcodebuild -version || true)
+          (pod --version || true)
+          (rustc --version || true)
+
+      - name: 选最新 Xcode（macos-14 上默认可能是旧版）
+        run: |
+          set -euo pipefail
+          echo "已安装的 Xcode："
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V 2>/dev/null | tail -1 || true)"
+          if [ -z "${NEWEST}" ]; then
+            NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -1 || true)"
+          fi
+          if [ -n "${NEWEST}" ]; then
+            echo "切换到 ${NEWEST}"
+            sudo xcode-select -s "${NEWEST}/Contents/Developer" || sudo xcode-select -s "${NEWEST}"
+          fi
+          sudo xcodebuild -license accept 2>/dev/null || true
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i "iphoneos" || true
+
+      - name: 读取 Flutter 版本（.fvmrc）
+        id: flutter_version
+        env:
+          INPUT_FLUTTER_VERSION: ${{ inputs.flutter_version }}
+        run: |
+          set -euo pipefail
+          V="${INPUT_FLUTTER_VERSION}"
+          if [ -z "${V}" ]; then
+            V="$(python3 -c 'import json;print(json.load(open(".fvmrc"))["flutter"])')"
+          fi
+          test -n "${V}"
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "Flutter 版本 = ${V}"
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: 安装 Rust 工具链 + iOS target
+        run: |
+          set -euo pipefail
+          CHANNEL="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml | head -1)"
+          echo "rust-toolchain.toml channel = ${CHANNEL:-<未找到，用默认>}"
+          if [ -n "${CHANNEL}" ]; then
+            rustup toolchain install "${CHANNEL}" --profile minimal --component clippy --no-self-update || true
+            rustup target add --toolchain "${CHANNEL}" aarch64-apple-ios x86_64-apple-ios
+            rustup target list --installed --toolchain "${CHANNEL}"
+            rustup show
+          else
+            rustup target add aarch64-apple-ios x86_64-apple-ios
+            rustup target list --installed
+          fi
+
+      - name: flutter pub get（workspace 根 app/）
+        working-directory: app
+        run: |
+          set -euo pipefail
+          flutter --version
+          flutter pub get
+
+      - name: 代码生成 build_runner + slang（失败可容错，仓库里已有生成物）
+        working-directory: app
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          dart run build_runner build --delete-conflicting-outputs
+          dart run slang
+          echo "代码生成完成"
+
+      - name: 可选覆盖（bundle id / 显示名 / 受限 entitlements）
+        env:
+          INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
+          INPUT_APP_NAME: ${{ inputs.app_name }}
+          INPUT_STRIP_ENTITLEMENTS: ${{ inputs.strip_entitlements }}
+        run: |
+          set -euo pipefail
+          PBX="app/ios/Runner.xcodeproj/project.pbxproj"
+
+          if [ -n "${INPUT_BUNDLE_ID}" ]; then
+            echo "${INPUT_BUNDLE_ID}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*$' \
+              || { echo "::error::bundle_id 只能含字母、数字、点、连字符"; exit 1; }
+            sed -i '' -E \
+              "s/(PRODUCT_BUNDLE_IDENTIFIER = )org\.localsend\.localsendApp(\.ShareExtension)?;/\1${INPUT_BUNDLE_ID}\2;/g" \
+              "${PBX}"
+            sed -i '' "s/group\.org\.localsend\.localsendApp/group.${INPUT_BUNDLE_ID}/g" \
+              app/ios/Runner/Runner.entitlements \
+              app/ios/ShareExtension/ShareExtension.entitlements
+            echo "bundle id → ${INPUT_BUNDLE_ID}"
+          fi
+
+          if [ -n "${INPUT_APP_NAME}" ]; then
+            python3 -c 'import plistlib,sys; p="app/ios/Runner/Info.plist"; d=plistlib.load(open(p,"rb")); d["CFBundleDisplayName"]=sys.argv[1]; plistlib.dump(d,open(p,"wb"))' "${INPUT_APP_NAME}"
+            echo "显示名 → ${INPUT_APP_NAME}"
+          fi
+
+          if [ "${INPUT_STRIP_ENTITLEMENTS}" = "true" ]; then
+            for f in app/ios/Runner/Runner.entitlements app/ios/ShareExtension/ShareExtension.entitlements; do
+              /usr/libexec/PlistBuddy -c "Delete :aps-environment" "$f" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.networking.multicast" "$f" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Delete :com.apple.security.application-groups" "$f" 2>/dev/null || true
+            done
+            echo "已删除 aps-environment / multicast / application-groups"
+          fi
+
+          echo "--- 当前 bundle id ---"
+          grep -n "PRODUCT_BUNDLE_IDENTIFIER" "${PBX}" | sort -u
+
+      - name: flutter build ios --release --no-codesign
+        working-directory: app
+        run: |
+          set -euo pipefail
+          export COCOAPODS_DISABLE_STATS=true
+          flutter build ios --release --no-codesign
+          echo "--- 构建产物 ---"
+          ls -la build/ios/iphoneos/ || true
+          ls -la build/ios/iphoneos/Runner.app 2>/dev/null | head -20 || true
+
+      - name: 组 Payload/ 并打成未签名 IPA
+        id: package
+        env:
+          INPUT_STRIP_SHARE_EXTENSION: ${{ inputs.strip_share_extension }}
+        run: |
+          set -euo pipefail
+          APP="app/build/ios/iphoneos/Runner.app"
+          if [ ! -d "${APP}" ]; then
+            echo "::error::找不到 ${APP}"
+            find app/build/ios -maxdepth 3 -type d 2>/dev/null | head -40 || true
+            exit 1
+          fi
+
+          # 防御性清理：未签名包不该带签名或描述文件
+          rm -rf "${APP}/_CodeSignature"
+          find "${APP}" -type d -name "_CodeSignature" -exec rm -rf {} + 2>/dev/null || true
+          find "${APP}" -name "*.mobileprovision" -delete 2>/dev/null || true
+          if find "${APP}" -name "*.mobileprovision" | grep -q .; then
+            echo "::error::Runner.app 内仍有 provisioning profile"
+            find "${APP}" -name "*.mobileprovision"
+            exit 1
+          fi
+
+          if [ "${INPUT_STRIP_SHARE_EXTENSION}" = "true" ]; then
+            rm -rf "${APP}/PlugIns/ShareExtension.appex"
+            echo "已从 Runner.app 删除 PlugIns/ShareExtension.appex（分享接收入口会消失）"
+          fi
+
+          STAGE="${RUNNER_TEMP}/ipa_stage"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}/Payload"
+          # ditto 保留符号链接与资源分叉（不要用 cp -R 代替）
+          ditto "${APP}" "${STAGE}/Payload/Runner.app"
+
+          VERSION="$(sed -n 's/^version: *\([0-9][0-9.]*\).*/\1/p' app/pubspec.yaml | head -1)"
+          OUT_DIR="${PWD}/dist"
+          mkdir -p "${OUT_DIR}"
+          OUT="${OUT_DIR}/LocalSend-${VERSION:-unknown}-unsigned.ipa"
+
+          ( cd "${STAGE}" && zip -qry "${OUT}" Payload )
+
+          echo "== IPA 文件 =="
+          ls -lh "${OUT}"
+          echo "== 顶层条目 =="
+          unzip -l "${OUT}" | head -8
+          echo "== 关键条目断言 =="
+          unzip -l "${OUT}" | grep -E "Payload/Runner.app/Info\.plist$" >/dev/null \
+            || { echo "::error::IPA 里没有 Payload/Runner.app/Info.plist"; exit 1; }
+          unzip -l "${OUT}" | grep -E "Payload/Runner.app/Runner$" >/dev/null \
+            || { echo "::error::IPA 里没有可执行文件 Payload/Runner.app/Runner"; exit 1; }
+          echo "== 符号链接条目（有则说明 zip -y 生效） =="
+          zipinfo -l "${OUT}" | awk '$1 ~ /^l/ {print; n++} END {if (!n) print "(无 symlink 条目，Flutter.framework 可能为扁平结构，正常)"}' | head -10
+          unzip -t "${OUT}" >/dev/null && echo "zip 完整性 OK"
+
+          SHA="$(shasum -a 256 "${OUT}" | awk '{print $1}')"
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "ipa=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建摘要
+        if: always() && steps.package.outcome == 'success'
+        env:
+          IPA_PATH: ${{ steps.package.outputs.ipa }}
+          IPA_SHA: ${{ steps.package.outputs.sha256 }}
+          IPA_VERSION: ${{ steps.package.outputs.version }}
+          FLUTTER_VER: ${{ steps.flutter_version.outputs.version }}
+          INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
+          INPUT_APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## iOS 未签名 IPA 已完成"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 文件 | $(basename "${IPA_PATH}") |"
+            echo "| 版本 | ${IPA_VERSION} |"
+            echo "| Flutter | ${FLUTTER_VER} |"
+            echo "| Bundle ID | ${INPUT_BUNDLE_ID:-org.localsend.localsendApp} |"
+            echo "| 显示名 | ${INPUT_APP_NAME:-LocalSend} |"
+            echo "| SHA256 | \`${IPA_SHA}\` |"
+            echo ""
+            echo "下载 artifact（zip）→ 解压得 .ipa → 全能签导入签名安装。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v6
+        with:
+          name: LocalSend-ios-unsigned-ipa
+          path: dist/*.ipa
+          if-no-files-found: error
+          retention-days: 7
