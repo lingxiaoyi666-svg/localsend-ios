@@ -828,7 +828,7 @@ Future<void> _handleFileUpload({
       cacheDirectory: config.cacheDirectory,
       fileName: desiredName,
       size: dartFile.size.toInt(),
-      sha256: dartFile.sha256,
+      sha256: dartFile.hash,
       path: target.path,
     );
 
@@ -857,7 +857,7 @@ Future<void> _handleFileUpload({
       cacheDirectory: config.cacheDirectory,
       fileName: desiredName,
       size: dartFile.size.toInt(),
-      sha256: dartFile.sha256,
+      sha256: dartFile.hash,
     );
 
     _logger.info('Saved ${dartFile.fileName}.');
