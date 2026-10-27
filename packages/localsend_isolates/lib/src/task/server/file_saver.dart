@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:gal/gal.dart';
 import 'package:localsend_isolates/rust/api/filename.dart' as rust_filename;
@@ -266,4 +268,252 @@ SdCardPath? getSdCardPath(String path) {
     return null;
   }
   return SdCardPath(match.group(1)!, match.group(2)!);
+}
+
+/// A partial file that an interrupted transfer can be continued from.
+class ResumeOffer {
+  /// Absolute path of the partial file.
+  final String path;
+
+  /// Bytes already on disk, i.e. the offset the sender has to continue at.
+  final int offset;
+
+  /// Opaque identifier of the partial file, echoed by the sender and checked
+  /// by the server before a single byte is appended.
+  final String partialId;
+
+  ResumeOffer({
+    required this.path,
+    required this.offset,
+    required this.partialId,
+  });
+
+  /// The bridge representation used for a resume offer:
+  /// `<fileId>\u{1f}<offset>\u{1f}<partialId>`.
+  ///
+  /// The unit separator cannot occur in a file ID, a file name, or a number,
+  /// so the payload needs no escaping.
+  String toWire(String fileId) => '$fileId\u{1f}$offset\u{1f}$partialId';
+}
+
+/// Remembers partial files so that an interrupted transfer can continue at the
+/// byte it stopped at instead of starting over.
+///
+/// Entries are keyed by the identity of the incoming file (name, size,
+/// checksum) and not by session or file ID: a sender that retries after a
+/// reconnect opens a new session and may even use a new file ID for the same
+/// content, while the bytes on disk are still the same prefix.
+///
+/// The index is a JSON file in the cache directory, so it survives an app
+/// restart and never litters the user's destination directory.
+class ResumeIndex {
+  static const _fileName = 'localsend_resume.json';
+
+  /// Entries older than this are dropped on load, so a partial file that is
+  /// never continued does not stay indexed forever.
+  static const _maxAge = Duration(days: 7);
+
+  /// The directory the index belongs to.
+  final String cacheDirectory;
+
+  final File _file;
+  final Map<String, _PartialEntry> _entries;
+
+  ResumeIndex._(this.cacheDirectory, this._file, this._entries);
+
+  /// Identity of an incoming file, independent of the session it arrives in.
+  static String keyOf({
+    required String fileName,
+    required int size,
+    String? sha256,
+  }) =>
+      '$fileName\u{1f}$size\u{1f}${sha256 ?? ''}';
+
+  static Future<ResumeIndex> load(String cacheDirectory) async {
+    final file = File(p.join(cacheDirectory, _fileName));
+    final entries = <String, _PartialEntry>{};
+
+    try {
+      if (await file.exists()) {
+        final decoded = jsonDecode(await file.readAsString());
+        if (decoded is Map) {
+          final raw = decoded['entries'];
+          if (raw is Map) {
+            final cutoff = DateTime.now().subtract(_maxAge).millisecondsSinceEpoch;
+            raw.forEach((key, value) {
+              if (key is! String || value is! Map) {
+                return;
+              }
+              final entry = _PartialEntry.fromJson(value);
+              if (entry == null || entry.updatedAtMs < cutoff) {
+                return;
+              }
+              entries[key] = entry;
+            });
+          }
+        }
+      }
+    } catch (e) {
+      // A broken index only loses the ability to continue; it must never
+      // prevent receiving a file from the beginning.
+      _logger.warning('Discarding unreadable resume index', e);
+    }
+
+    return ResumeIndex._(cacheDirectory, file, entries);
+  }
+
+  /// Returns the offer for the file identified by [key], or `null` when
+  /// nothing can be continued.
+  ///
+  /// An entry is only offered when the partial file still exists and is
+  /// neither empty nor complete. The offset is read from disk instead of from
+  /// the index, so bytes written after the last update are not announced as
+  /// missing.
+  Future<ResumeOffer?> offerFor({
+    required String key,
+    required int expectedSize,
+  }) async {
+    final entry = _entries[key];
+    if (entry == null) {
+      return null;
+    }
+
+    final int length;
+    try {
+      if (await FileSystemEntity.type(entry.path, followLinks: false) != FileSystemEntityType.file) {
+        _entries.remove(key);
+        return null;
+      }
+      length = await File(entry.path).length();
+    } catch (e) {
+      _logger.warning('Could not inspect the partial file at ${entry.path}', e);
+      _entries.remove(key);
+      return null;
+    }
+
+    if (length <= 0 || length >= expectedSize) {
+      // Either nothing arrived, or the file is already complete.
+      _entries.remove(key);
+      return null;
+    }
+
+    entry
+      ..offset = length
+      ..updatedAtMs = DateTime.now().millisecondsSinceEpoch;
+
+    return ResumeOffer(
+      path: entry.path,
+      offset: length,
+      partialId: entry.partialId,
+    );
+  }
+
+  /// Records how much of the file at [path] has been received.
+  ///
+  /// A missing, empty, or complete file drops the entry: there is nothing left
+  /// to continue. A new partial file gets a new [ResumeOffer.partialId], so an
+  /// offer from an earlier attempt cannot be reused against different bytes.
+  Future<void> record({
+    required String key,
+    required String path,
+    required int expectedSize,
+  }) async {
+    final int length;
+    try {
+      if (await FileSystemEntity.type(path, followLinks: false) != FileSystemEntityType.file) {
+        await remove(key);
+        return;
+      }
+      length = await File(path).length();
+    } catch (e) {
+      _logger.warning('Could not inspect the partial file at $path', e);
+      await remove(key);
+      return;
+    }
+
+    if (length <= 0 || length >= expectedSize) {
+      await remove(key);
+      return;
+    }
+
+    final previous = _entries[key];
+    _entries[key] = _PartialEntry(
+      path: path,
+      offset: length,
+      partialId: previous != null && previous.path == path ? previous.partialId : _newPartialId(),
+      updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    await flush();
+  }
+
+  /// Forgets the entry of the file identified by [key].
+  Future<void> remove(String key) async {
+    if (_entries.remove(key) != null) {
+      await flush();
+    }
+  }
+
+  /// Writes the index back to disk.
+  ///
+  /// The new content is written to a temporary file and renamed over the old
+  /// one, so a process that dies halfway cannot leave a half-written index.
+  Future<void> flush() async {
+    try {
+      final json = jsonEncode({
+        'entries': {
+          for (final entry in _entries.entries) entry.key: entry.value.toJson(),
+        },
+      });
+
+      await _file.parent.create(recursive: true);
+      final temp = File('${_file.path}.tmp');
+      await temp.writeAsString(json, flush: true);
+      await temp.rename(_file.path);
+    } catch (e) {
+      _logger.warning('Could not persist the resume index', e);
+    }
+  }
+
+  static String _newPartialId() {
+    final random = Random.secure();
+    return List.generate(16, (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+  }
+}
+
+/// One entry of a [ResumeIndex].
+class _PartialEntry {
+  final String path;
+  int offset;
+  final String partialId;
+  int updatedAtMs;
+
+  _PartialEntry({
+    required this.path,
+    required this.offset,
+    required this.partialId,
+    required this.updatedAtMs,
+  });
+
+  static _PartialEntry? fromJson(Map<dynamic, dynamic> json) {
+    final path = json['path'];
+    final offset = json['offset'];
+    final partialId = json['partialId'];
+    final updatedAtMs = json['updatedAt'];
+    if (path is! String || path.isEmpty || offset is! int || partialId is! String || partialId.isEmpty || updatedAtMs is! int) {
+      return null;
+    }
+    return _PartialEntry(
+      path: path,
+      offset: offset,
+      partialId: partialId,
+      updatedAtMs: updatedAtMs,
+    );
+  }
+
+  Map<String, Object?> toJson() => {
+        'path': path,
+        'offset': offset,
+        'partialId': partialId,
+        'updatedAt': updatedAtMs,
+      };
 }

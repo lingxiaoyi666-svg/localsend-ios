@@ -38,6 +38,12 @@ class SettingsState with SettingsStateMappable {
   final bool receiveViaLinkAutoAccept;
   final bool createChecksums; // create checksums when sending files
   final bool verifyChecksums; // verify checksums when receiving files
+  /// true = incoming files go to [destination] without asking.
+  /// false = the user is asked for the destination on every incoming transfer.
+  final bool autoSaveToDestination;
+  /// Comma separated list of file extensions that are accepted without asking
+  /// when the sender is a favorite. Empty = no filter, every file is accepted.
+  final String autoAcceptExtensions;
   final int discoveryTimeout;
   final bool advancedSettings;
 
@@ -71,6 +77,8 @@ class SettingsState with SettingsStateMappable {
     required this.receiveViaLinkAutoAccept,
     required this.createChecksums,
     required this.verifyChecksums,
+    required this.autoSaveToDestination,
+    required this.autoAcceptExtensions,
     required this.discoveryTimeout,
     required this.advancedSettings,
   });

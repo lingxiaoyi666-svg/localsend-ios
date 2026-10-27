@@ -61,6 +61,9 @@ class ReceivePage extends StatefulWidget {
 }
 
 class _ReceivePageState extends State<ReceivePage> with Refena {
+  /// The text message that has already been pushed to the clipboard.
+  String? _copiedMessage;
+
   @override
   Widget build(BuildContext context) {
     final vm = context.watch(
@@ -72,6 +75,13 @@ class _ReceivePageState extends State<ReceivePage> with Refena {
         }
       },
     );
+
+    if (vm.message != null && vm.message != _copiedMessage) {
+      // Clipboard handoff: an incoming text message lands in the clipboard right
+      // away, so the user does not have to tap "copy" first.
+      _copiedMessage = vm.message;
+      unawaited(Clipboard.setData(ClipboardData(text: vm.message!)));
+    }
 
     if (vm.status == null && vm.message == null) {
       return const Scaffold(

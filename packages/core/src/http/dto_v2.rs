@@ -108,6 +108,41 @@ pub struct PrepareUploadResponseDtoV2 {
     /// Map of file ID to file token.
     /// Only contains files that were accepted by the receiver.
     pub files: HashMap<String, String>,
+
+    /// Resume offers, mapped by file ID (protocol extension).
+    ///
+    /// Present when the receiver holds a partial file for that file. Senders
+    /// that do not know this field ignore it, so a missing entry means "start
+    /// at 0".
+    ///
+    /// The field is skipped when empty, so a response without offers is
+    /// byte-identical to protocol v2.2.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub resume: HashMap<String, ResumeOfferDtoV2>,
+}
+
+/// A resume offer for one file (protocol extension, receiver → sender).
+///
+/// The receiver already holds `offset` bytes of the file and is willing to
+/// accept the rest. The sender continues the upload with
+/// `POST /api/localsend/v2/upload?...&offset=<offset>&partialId=<partialId>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeOfferDtoV2 {
+    /// Number of bytes the receiver already holds.
+    ///
+    /// The sender must skip exactly this many bytes of the file content.
+    /// `0` is never offered: a file without partial content is simply uploaded
+    /// from the start, exactly like in protocol v2.2.
+    pub offset: u64,
+
+    /// Opaque identifier of the receiver's partial file.
+    ///
+    /// Binds the offer to the partial file it was computed for, so an offset
+    /// that is replayed from an unrelated transfer (or from a partial file that
+    /// was meanwhile replaced) cannot be applied to the wrong content. The
+    /// receiver rejects an upload whose `partialId` does not match the offer.
+    pub partial_id: String,
 }
 
 pub struct PrepareUploadResultV2 {

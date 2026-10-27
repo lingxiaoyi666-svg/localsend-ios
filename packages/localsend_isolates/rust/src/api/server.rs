@@ -4,6 +4,7 @@ pub use localsend::http::dto_v2::RegisterDtoV2;
 use localsend::http::server::ServerConfigV2;
 pub use localsend::http::server::TlsConfig;
 use localsend::http::server::common::save::FileUploadTarget;
+use localsend::http::server::common::session::ResumeOfferV2;
 use localsend::http::server::internal::{InternalConfig, InternalEvent};
 pub use localsend::http::server::v2::SessionEndReasonV2;
 use localsend::http::server::v2::{PrepareUploadDecisionV2, ServerEventV2};
@@ -15,7 +16,7 @@ use localsend::http::state::ClientInfo;
 use localsend::model::discovery::DeviceType;
 use localsend::model::discovery::ProtocolType;
 use localsend::model::transfer::{FileContent, FileDto};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -484,16 +485,43 @@ impl RsHttpServer {
     ///
     /// Passing the accepted file IDs (a subset of the offered files) accepts the request.
     /// Passing `None` declines the request.
+    ///
+    /// [resume_offers] announces that a partial copy of an accepted file
+    /// already exists on disk and may be continued at a given offset. Each
+    /// entry is `"<fileId>\u{1f}<offset>\u{1f}<partialId>"`; the separator is a
+    /// unit separator so it cannot appear in a file ID or a file name. Entries
+    /// that do not parse, name an unaccepted file, or use offset 0 are ignored,
+    /// and without a single valid entry the decision is a plain accept.
+    ///
+    /// The offers are forwarded to every sender unless it asked for the plain
+    /// v2.2 response with `?resume=0` on prepare-upload. A sender that does not
+    /// know the field ignores it and transfers the file from the beginning.
     pub async fn respond_prepare_upload(
         &self,
         accepted_file_ids: Option<Vec<String>>,
+        resume_offers: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
         let Some((_, decision_tx)) = self.pending_decision.lock().await.take() else {
             return Err(anyhow::anyhow!("No pending prepare-upload request"));
         };
 
         let decision = match accepted_file_ids {
-            Some(ids) => PrepareUploadDecisionV2::Accept(ids.into_iter().collect()),
+            Some(ids) => {
+                let files: HashSet<String> = ids.into_iter().collect();
+                let offers: HashMap<String, ResumeOfferV2> = resume_offers
+                    .as_deref()
+                    .map(parse_resume_offers)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(file_id, _)| files.contains(file_id))
+                    .collect();
+
+                if offers.is_empty() {
+                    PrepareUploadDecisionV2::Accept(files)
+                } else {
+                    PrepareUploadDecisionV2::AcceptWithResume { files, offers }
+                }
+            }
             None => PrepareUploadDecisionV2::Decline,
         };
 
@@ -804,4 +832,45 @@ pub struct _RegisterDtoV2 {
 pub enum _SessionEndReasonV2 {
     Finished,
     Cancelled,
+}
+
+/// Field separator of a single resume offer inside the bridge payload.
+///
+/// A unit separator never occurs in a file ID, a file name, or a decimal
+/// number, so the format needs no escaping.
+const RESUME_OFFER_SEPARATOR: char = '\u{1f}';
+
+/// Parses the resume offers passed to [RsHttpServer::respond_prepare_upload].
+///
+/// Kept private so it stays out of the generated bindings; the payload is a
+/// plain list of strings to avoid a custom struct codec on the Dart side.
+fn parse_resume_offers(raw: &[String]) -> HashMap<String, ResumeOfferV2> {
+    let mut offers = HashMap::with_capacity(raw.len());
+
+    for entry in raw {
+        let mut fields = entry.split(RESUME_OFFER_SEPARATOR);
+        let (Some(file_id), Some(offset), Some(partial_id)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+
+        let Ok(offset) = offset.parse::<u64>() else {
+            continue;
+        };
+
+        if file_id.is_empty() || partial_id.is_empty() || offset == 0 {
+            continue;
+        }
+
+        offers.insert(
+            file_id.to_owned(),
+            ResumeOfferV2 {
+                offset,
+                partial_id: partial_id.to_owned(),
+            },
+        );
+    }
+
+    offers
 }

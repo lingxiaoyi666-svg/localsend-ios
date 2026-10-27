@@ -1,6 +1,7 @@
+use crate::http::dto::ErrorResponse;
 use crate::http::dto_v2::{
     InfoResponseDtoV2, PrepareUploadRequestDtoV2, PrepareUploadResponseDtoV2, RegisterDtoV2,
-    RegisterResponseDtoV2,
+    RegisterResponseDtoV2, ResumeOfferDtoV2,
 };
 use crate::http::server::common::collect_to_json::CollectToJson;
 use crate::http::server::common::error::AppError;
@@ -9,7 +10,7 @@ use crate::http::server::common::query::parse_query;
 use crate::http::server::common::response::{empty_body, BoxedBody, JsonResponse};
 use crate::http::server::common::save::{FileTimestamps, FileUploadTarget, SaveResult};
 use crate::http::server::common::session::{
-    FileStatusV2, PendingSessionV2, SessionFileV2, SessionStateV2, UploadSessionV2,
+    FileStatusV2, PendingSessionV2, ResumeOfferV2, SessionFileV2, SessionStateV2, UploadSessionV2,
 };
 use crate::http::server::PeerIp;
 use crate::http::server::{common, AppState, RequestClientInfo, V2State};
@@ -137,6 +138,20 @@ pub enum PrepareUploadDecisionV2 {
     /// An empty set responds with 204 (no file transfer needed).
     Accept(HashSet<String>),
 
+    /// Accept the given file IDs and offer to continue these files where an
+    /// interrupted transfer stopped (protocol extension).
+    ///
+    /// `offers` maps a file ID to the resume offer for that file; files not in
+    /// the map are uploaded from the beginning. The receiver only accepts the
+    /// continued upload if the sender quotes the offer's offset and partial ID,
+    /// so a wrong or stale offer falls back to a full upload instead of mixing
+    /// content. Offers are forwarded unless the sender asked for the plain
+    /// v2.2 response with `?resume=0`.
+    AcceptWithResume {
+        files: HashSet<String>,
+        offers: HashMap<String, ResumeOfferV2>,
+    },
+
     /// Decline the request (403).
     Decline,
 }
@@ -231,6 +246,14 @@ pub(crate) async fn prepare_upload(
     let v2 = require_v2(&state)?;
     let query = parse_query(req.uri().query());
 
+    // Protocol extension: resume offers are part of the response by default,
+    // because a sender that does not know the field simply ignores it (every
+    // JSON decoder in the ecosystem ignores unknown fields). A sender that
+    // wants the byte-for-byte v2.2 response can ask for it with `?resume=0`.
+    let resume_disabled = query
+        .get("resume")
+        .is_some_and(|value| value.as_str() == "0" || value.as_str() == "false");
+
     check_pin(
         v2.pin.as_deref(),
         &v2.pin_attempts,
@@ -298,7 +321,7 @@ pub(crate) async fn prepare_upload(
         }
     };
 
-    let accepted_ids = match decision {
+    let (accepted_ids, offers) = match decision {
         PrepareUploadDecisionV2::Decline => {
             pending_guard.clear().await;
             return Err(AppError::Message(
@@ -306,7 +329,12 @@ pub(crate) async fn prepare_upload(
                 "Rejected".to_string(),
             ));
         }
-        PrepareUploadDecisionV2::Accept(ids) => ids,
+        PrepareUploadDecisionV2::Accept(ids) => (ids, HashMap::new()),
+        PrepareUploadDecisionV2::AcceptWithResume { files, offers } => match resume_disabled {
+            // `?resume=0` reproduces the exact v2.2 response body.
+            true => (files, HashMap::new()),
+            false => (files, offers),
+        },
     };
 
     let files: HashMap<String, SessionFileV2> = payload
@@ -314,11 +342,14 @@ pub(crate) async fn prepare_upload(
         .into_iter()
         .filter(|(id, _)| accepted_ids.contains(id))
         .map(|(id, dto)| {
+            let resume = offers.get(&id).cloned();
             let file = SessionFileV2 {
                 dto,
                 token: Uuid::new_v4().to_string(),
                 status: FileStatusV2::Pending,
                 attempts: 0,
+                resume,
+                resume_rejections: 0,
             };
             (id, file)
         })
@@ -335,6 +366,23 @@ pub(crate) async fn prepare_upload(
     let tokens: HashMap<String, String> = files
         .iter()
         .map(|(id, file)| (id.clone(), file.token.clone()))
+        .collect();
+
+    // Protocol extension: tell the sender where to continue. Only files with a
+    // granted offer appear here; everything else is uploaded from the start.
+    let resume: HashMap<String, ResumeOfferDtoV2> = files
+        .iter()
+        .filter_map(|(id, file)| {
+            file.resume.as_ref().map(|offer| {
+                (
+                    id.clone(),
+                    ResumeOfferDtoV2 {
+                        offset: offer.offset,
+                        partial_id: offer.partial_id.clone(),
+                    },
+                )
+            })
+        })
         .collect();
 
     {
@@ -354,6 +402,7 @@ pub(crate) async fn prepare_upload(
         body: PrepareUploadResponseDtoV2 {
             session_id,
             files: tokens,
+            resume,
         },
     }
     .into_response())
@@ -378,8 +427,16 @@ pub(crate) async fn upload(
         ));
     };
 
+    // Optional resume parameters (protocol extension). A malformed offset is
+    // treated like a missing one, so a sender that mangles it still gets a
+    // plain upload from the start instead of a hard error.
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.parse::<u64>().ok());
+    let partial_id = query.get("partialId");
+
     // Validate the request and mark the file as in progress.
-    let file_dto = {
+    let (file_dto, resume_offset, resume_rejected) = {
         let mut slot = v2.session.lock().await;
         let Some(SessionStateV2::Active(session)) = slot.as_mut() else {
             return Err(invalid_token_error());
@@ -393,10 +450,46 @@ pub(crate) async fn upload(
         if file.token != *token || file.status != FileStatusV2::Pending {
             return Err(invalid_token_error());
         }
-        file.status = FileStatusV2::InProgress;
-        file.attempts = file.attempts.saturating_add(1);
-        file.dto.clone()
+
+        // Resume validation runs after the token check (a wrong token must not
+        // reveal anything about partial files) and before the file is marked in
+        // progress (a rejected offer must leave the file retryable).
+        let mut rejected = false;
+        let resume_offset = match (offset, partial_id, file.resume.clone()) {
+            (None | Some(0), _, _) => None,
+            (Some(offset), partial_id, Some(offer))
+                if offer.offset == offset
+                    && partial_id.is_some_and(|id| *id == offer.partial_id)
+                    && offset <= file.dto.size =>
+            {
+                Some(offset)
+            }
+            (Some(_), _, _) => {
+                // The offer cannot be honored: unknown partial file, stale
+                // offset, or a partial file that was replaced meanwhile.
+                // Dropping the offer makes the next attempt a plain upload from
+                // the beginning; repeated claims end the file so a broken sender
+                // cannot loop forever.
+                rejected = true;
+                file.resume = None;
+                file.resume_rejections = file.resume_rejections.saturating_add(1);
+                if file.resume_rejections > MAX_RESUME_REJECTIONS {
+                    file.status = FileStatusV2::Failed;
+                }
+                None
+            }
+        };
+
+        if !rejected {
+            file.status = FileStatusV2::InProgress;
+            file.attempts = file.attempts.saturating_add(1);
+        }
+        (file.dto.clone(), resume_offset, rejected)
     };
+
+    if resume_rejected {
+        return Ok(resume_rejected_response());
+    }
 
     // Marks the file as failed if this request is aborted mid-transfer.
     let mut upload_guard = UploadGuard::new(v2.clone(), session_id.clone(), file_id.clone());
@@ -437,6 +530,7 @@ pub(crate) async fn upload(
         file_size,
         expected_sha256.as_deref(),
         timestamps,
+        resume_offset,
     )
     .await;
 
@@ -449,6 +543,7 @@ pub(crate) async fn upload(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Checksum mismatch".to_string(),
         )),
+        SaveResult::ResumeRejected => Ok(resume_rejected_response()),
     }
 }
 
@@ -645,6 +740,35 @@ impl Drop for UploadGuard {
 /// Senders must not retry more often than this (see the upload isolate).
 const MAX_UPLOAD_ATTEMPTS: u8 = 3;
 
+/// How often a sender may claim a resume offset that the receiver cannot honor
+/// before the file is marked as failed.
+///
+/// Every rejected claim costs nothing but a 416 response, but a sender that
+/// keeps claiming one would otherwise retry forever.
+const MAX_RESUME_REJECTIONS: u8 = 3;
+
+/// Response for an upload whose resume offset cannot be applied (416).
+///
+/// The status tells the sender to repeat the file from the beginning; the
+/// header marks it as a resume problem so it is not confused with a size or
+/// range error of a plain upload. The body matches the other error responses.
+fn resume_rejected_response() -> Response<BoxedBody> {
+    let mut response = JsonResponse {
+        status: StatusCode::RANGE_NOT_SATISFIABLE,
+        body: ErrorResponse {
+            message: "Cannot resume at the requested offset".to_string(),
+        },
+    }
+    .into_response();
+
+    response.headers_mut().insert(
+        "x-localsend-resume",
+        hyper::header::HeaderValue::from_static("rejected"),
+    );
+
+    response
+}
+
 /// Sets the final status of a file and ends the session once all files are done.
 ///
 /// A checksum mismatch resets the file to [FileStatusV2::Pending] (as long as
@@ -661,8 +785,15 @@ async fn finalize_file(v2: &V2State, session_id: &str, file_id: &str, result: Sa
         }
         if let Some(file) = session.files.get_mut(file_id) {
             if file.status == FileStatusV2::InProgress {
+                if result == SaveResult::ResumeRejected {
+                    // The partial file could not be continued. The offer is
+                    // withdrawn so the next attempt is a plain upload from the
+                    // beginning, which the receiver still accepts.
+                    file.resume = None;
+                }
                 file.status = match result {
                     SaveResult::Success => FileStatusV2::Finished,
+                    SaveResult::ResumeRejected => FileStatusV2::Pending,
                     SaveResult::HashMismatch if file.attempts < MAX_UPLOAD_ATTEMPTS => {
                         FileStatusV2::Pending
                     }

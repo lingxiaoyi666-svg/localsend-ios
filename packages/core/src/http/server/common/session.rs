@@ -58,6 +58,35 @@ pub(crate) struct SessionFileV2 {
     /// Limits how often a checksum mismatch resets the file to
     /// [FileStatusV2::Pending] for a retry.
     pub(crate) attempts: u8,
+
+    /// The resume offer the application granted for this file, if any.
+    ///
+    /// `None` means the file is transferred from the beginning, which is the
+    /// only behavior protocol v2.2 senders ever see.
+    pub(crate) resume: Option<ResumeOfferV2>,
+
+    /// Number of resume requests rejected for this file.
+    /// Limits how often a sender may claim an offset that the receiver cannot
+    /// honor, each of which costs the receiver nothing but a 416 response.
+    pub(crate) resume_rejections: u8,
+}
+
+/// A resume offer granted by the application for a file of this session.
+///
+/// The offer mirrors [crate::http::dto_v2::ResumeOfferDtoV2] but stays in the
+/// server state so the upload request can be validated against it.
+///
+/// Public (unlike the rest of the session state) because
+/// [crate::http::server::v2::PrepareUploadDecisionV2::AcceptWithResume] is
+/// built outside of this crate.
+#[derive(Clone, Debug)]
+pub struct ResumeOfferV2 {
+    /// Number of bytes the partial file already holds.
+    pub offset: u64,
+
+    /// Opaque identifier of the partial file
+    /// (see `crate::http::dto_v2::ResumeOfferDtoV2::partial_id`).
+    pub partial_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

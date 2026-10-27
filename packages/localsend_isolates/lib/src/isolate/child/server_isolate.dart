@@ -367,6 +367,12 @@ class _ReceiveSession {
   /// of being saved next to it under a numbered name.
   final Map<String, FileSaveTarget> targets = {};
 
+  /// The partial file each file of this session continues, by file ID.
+  ///
+  /// Only filled for files the application offered a resume offset for; empty
+  /// for every transfer that starts from the beginning.
+  final Map<String, ResumeOffer> resumeOffers = {};
+
   _ReceiveSession(this.config);
 }
 
@@ -375,6 +381,26 @@ final _receiveSessionProvider = Provider((ref) => _ReceiveSessionHolder());
 
 class _ReceiveSessionHolder {
   _ReceiveSession? session;
+
+  /// The files announced by the last [RsServerEvent_PrepareUpload], so the
+  /// decision (a separate task) can look up size and checksum for a resume
+  /// offer.
+  Map<String, FileDto>? offeredFiles;
+
+  /// The resume index of [ResumeIndex.cacheDirectory], loaded on first use.
+  ResumeIndex? resumeIndex;
+}
+
+/// Returns the resume index of [cacheDirectory], loading it once.
+Future<ResumeIndex> _resumeIndex(Ref ref, String cacheDirectory) async {
+  final holder = ref.read(_receiveSessionProvider);
+  final cached = holder.resumeIndex;
+  if (cached != null && cached.cacheDirectory == cacheDirectory) {
+    return cached;
+  }
+  final index = await ResumeIndex.load(cacheDirectory);
+  holder.resumeIndex = index;
+  return index;
 }
 
 Future<void> setupHttpServerIsolate(
@@ -458,6 +484,9 @@ Future<void> setupHttpServerIsolate(
                   // The Rust server is the authority on the single-session
                   // invariant: a new request means the old session is over.
                   holder.session = null;
+                  // Kept for the decision, which is a separate task and needs
+                  // the sizes and checksums to offer a resume offset.
+                  holder.offeredFiles = files;
                   emit(
                     HttpServerPrepareUploadEvent(
                       sessionId: sessionId,
@@ -567,10 +596,48 @@ Future<void> setupHttpServerIsolate(
           return;
         case HttpServerPrepareUploadDecisionTask decisionTask:
           final config = decisionTask.config;
+          final holder = ref.read(_receiveSessionProvider);
+          final offeredFiles = holder.offeredFiles;
+          holder.offeredFiles = null;
+
           // An empty fileNameMap accepts nothing: the Rust server responds
           // with 204 and creates no session.
-          ref.read(_receiveSessionProvider).session = config == null || config.fileNameMap.isEmpty ? null : _ReceiveSession(config);
-          await ref.read(httpServerProvider).respondPrepareUpload(acceptedFileIds: config?.fileNameMap.keys.toList());
+          final session = config == null || config.fileNameMap.isEmpty ? null : _ReceiveSession(config);
+          holder.session = session;
+
+          final resumeOffers = <String>[];
+          if (session != null) {
+            final index = await _resumeIndex(ref, session.config.cacheDirectory);
+            for (final entry in session.config.fileNameMap.entries) {
+              final fileId = entry.key;
+              final file = offeredFiles?[fileId];
+              if (file == null || file.sha256 == null) {
+                // Without a checksum neither side can prove that the bytes
+                // already on disk belong to this file, so it is not continued.
+                continue;
+              }
+
+              final offer = await index.offerFor(
+                key: ResumeIndex.keyOf(
+                  fileName: entry.value,
+                  size: file.size.toInt(),
+                  sha256: file.sha256,
+                ),
+                expectedSize: file.size.toInt(),
+              );
+              if (offer == null) {
+                continue;
+              }
+
+              session.resumeOffers[fileId] = offer;
+              resumeOffers.add(offer.toWire(fileId));
+            }
+          }
+
+          await ref.read(httpServerProvider).respondPrepareUpload(
+                acceptedFileIds: config?.fileNameMap.keys.toList(),
+                resumeOffers: resumeOffers.isEmpty ? null : resumeOffers,
+              );
           return;
         case HttpServerCancelSessionTask cancelTask:
           final holder = ref.read(_receiveSessionProvider);
@@ -610,6 +677,50 @@ Future<void> setupHttpServerIsolate(
   );
 }
 
+/// Remembers how much of an interrupted file arrived, so the next attempt can
+/// continue at that byte instead of starting over.
+///
+/// Only files with a checksum and a plain path are recorded: without a
+/// checksum neither side can prove that the bytes on disk belong to this file,
+/// and a content URI (Android SAF) is not a file the index can inspect.
+Future<void> _rememberPartialFile({
+  required Ref ref,
+  required String cacheDirectory,
+  required String fileName,
+  required int size,
+  required String? sha256,
+  required String? path,
+}) async {
+  if (sha256 == null || path == null || path.startsWith('content://')) {
+    return;
+  }
+
+  final index = await _resumeIndex(ref, cacheDirectory);
+  await index.record(
+    key: ResumeIndex.keyOf(fileName: fileName, size: size, sha256: sha256),
+    path: path,
+    expectedSize: size,
+  );
+}
+
+/// Forgets the partial file of a completed transfer.
+Future<void> _forgetPartialFile({
+  required Ref ref,
+  required String cacheDirectory,
+  required String fileName,
+  required int size,
+  required String? sha256,
+}) async {
+  if (sha256 == null) {
+    return;
+  }
+
+  final index = await _resumeIndex(ref, cacheDirectory);
+  await index.remove(
+    ResumeIndex.keyOf(fileName: fileName, size: size, sha256: sha256),
+  );
+}
+
 /// Receives a single file without involving the main isolate:
 /// resolves the save target, lets the Rust server write the file and applies
 /// the post-processing (timestamps, gallery).
@@ -646,19 +757,30 @@ Future<void> _handleFileUpload({
 
   final FileSaveTarget target;
   try {
-    // A previous attempt at this file already picked a destination, which this
-    // attempt overwrites instead of creating a numbered version.
-    final previous = session.targets[fileId];
-    target = previous != null
-        ? await reopenFileSaveTarget(previous)
-        : await prepareFileSaveTarget(
-            destinationDirectory: config.destinationDirectory,
-            cacheDirectory: config.cacheDirectory,
-            fileName: desiredName,
-            saveToGallery: shouldSaveToGallery,
-            createdDirectories: session.createdDirectories,
-            androidSdkInt: config.androidSdkInt,
-          );
+    final resume = session.resumeOffers[fileId];
+    if (resume != null) {
+      // The partial file is the destination: the server appends to it at the
+      // offered offset instead of creating a numbered copy next to it.
+      target = FileSaveTarget(
+        path: resume.path,
+        fileDescriptor: null,
+        displayPath: resume.path,
+      );
+    } else {
+      // A previous attempt at this file already picked a destination, which this
+      // attempt overwrites instead of creating a numbered version.
+      final previous = session.targets[fileId];
+      target = previous != null
+          ? await reopenFileSaveTarget(previous)
+          : await prepareFileSaveTarget(
+              destinationDirectory: config.destinationDirectory,
+              cacheDirectory: config.cacheDirectory,
+              fileName: desiredName,
+              saveToGallery: shouldSaveToGallery,
+              createdDirectories: session.createdDirectories,
+              androidSdkInt: config.androidSdkInt,
+            );
+    }
     session.targets[fileId] = target;
   } catch (e, st) {
     _logger.severe('Failed to prepare save target', e, st);
@@ -699,6 +821,17 @@ Future<void> _handleFileUpload({
     // The incomplete file is kept: a retry of this file overwrites it, and
     // otherwise it stays behind as the partial file of a failed transfer.
     _logger.severe('Failed to save file', e, st);
+
+    // Remember how much arrived, so a retry can continue at that byte.
+    await _rememberPartialFile(
+      ref: ref,
+      cacheDirectory: config.cacheDirectory,
+      fileName: desiredName,
+      size: dartFile.size.toInt(),
+      sha256: dartFile.sha256,
+      path: target.path,
+    );
+
     emitFailed(e);
     return;
   }
@@ -717,6 +850,15 @@ Future<void> _handleFileUpload({
     } else {
       filePath = target.displayPath;
     }
+
+    // The file is complete, so there is nothing left to continue.
+    await _forgetPartialFile(
+      ref: ref,
+      cacheDirectory: config.cacheDirectory,
+      fileName: desiredName,
+      size: dartFile.size.toInt(),
+      sha256: dartFile.sha256,
+    );
 
     _logger.info('Saved ${dartFile.fileName}.');
     emit(

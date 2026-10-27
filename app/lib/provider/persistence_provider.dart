@@ -94,6 +94,8 @@ const _shareViaLinkAutoAccept = 'ls_share_via_link_auto_accept';
 const _receiveViaLinkAutoAccept = 'ls_receive_via_link_auto_accept';
 const _createChecksums = 'ls_create_checksums';
 const _verifyChecksums = 'ls_verify_checksums';
+const _autoSaveToDestination = 'ls_auto_save_to_destination';
+const _autoAcceptExtensions = 'ls_auto_accept_extensions';
 const _advancedSettingsKey = 'ls_advanced_settings';
 const _whatsNewKey = 'ls_whats_new';
 
@@ -410,6 +412,22 @@ class PersistenceService {
 
   Future<void> setVerifyChecksums(bool verifyChecksums) async {
     await _prefs.setBool(_verifyChecksums, verifyChecksums);
+  }
+
+  bool isAutoSaveToDestination() {
+    return _prefs.getBool(_autoSaveToDestination) ?? true;
+  }
+
+  Future<void> setAutoSaveToDestination(bool value) async {
+    await _prefs.setBool(_autoSaveToDestination, value);
+  }
+
+  String getAutoAcceptExtensions() {
+    return _prefs.getString(_autoAcceptExtensions) ?? '';
+  }
+
+  Future<void> setAutoAcceptExtensions(String value) async {
+    await _prefs.setString(_autoAcceptExtensions, value);
   }
 
   String getMulticastGroup() {

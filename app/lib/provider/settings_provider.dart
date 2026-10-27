@@ -77,6 +77,8 @@ class SettingsService extends PureNotifier<SettingsState> {
     receiveViaLinkAutoAccept: _persistence.getReceiveViaLinkAutoAccept(),
     createChecksums: _persistence.getCreateChecksums(),
     verifyChecksums: _persistence.getVerifyChecksums(),
+    autoSaveToDestination: _persistence.isAutoSaveToDestination(),
+    autoAcceptExtensions: _persistence.getAutoAcceptExtensions(),
     discoveryTimeout: _persistence.getDiscoveryTimeout(),
     advancedSettings: _persistence.getAdvancedSettingsEnabled(),
   );
@@ -309,6 +311,20 @@ class SettingsService extends PureNotifier<SettingsState> {
     await _persistence.setVerifyChecksums(verifyChecksums);
     state = state.copyWith(
       verifyChecksums: verifyChecksums,
+    );
+  }
+
+  Future<void> setAutoSaveToDestination(bool value) async {
+    await _persistence.setAutoSaveToDestination(value);
+    state = state.copyWith(
+      autoSaveToDestination: value,
+    );
+  }
+
+  Future<void> setAutoAcceptExtensions(String value) async {
+    await _persistence.setAutoAcceptExtensions(value);
+    state = state.copyWith(
+      autoAcceptExtensions: value,
     );
   }
 }

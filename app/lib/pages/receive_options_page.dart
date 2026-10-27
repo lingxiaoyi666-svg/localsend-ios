@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:localsend_app/gen/strings.g.dart';
 import 'package:localsend_app/pages/receive_page.dart';
 import 'package:localsend_app/provider/network/server/server_provider.dart';
+import 'package:localsend_app/provider/settings_provider.dart';
 import 'package:localsend_app/provider/selection/selected_receiving_files_provider.dart';
 import 'package:localsend_app/util/file_type_ext.dart';
+import 'package:localsend_app/util/native/ios_channel.dart';
 import 'package:localsend_app/util/native/pick_directory_path.dart';
 import 'package:localsend_app/util/native/platform_check.dart';
 import 'package:localsend_app/widget/custom_dropdown_button.dart';
@@ -14,13 +16,51 @@ import 'package:localsend_app/widget/responsive_list_view.dart';
 import 'package:localsend_isolates/util/file_size_helper.dart';
 import 'package:refena_flutter/refena_flutter.dart';
 
-class ReceiveOptionsPage extends StatelessWidget {
+class ReceiveOptionsPage extends StatefulWidget {
   final ReceivePageVm vm;
 
   const ReceiveOptionsPage(this.vm);
 
   @override
+  State<ReceiveOptionsPage> createState() => _ReceiveOptionsPageState();
+}
+
+class _ReceiveOptionsPageState extends State<ReceiveOptionsPage> {
+  bool _didPromptDestination = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!checkPlatformCanChangeDestination()) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => _promptDestinationIfNeeded());
+  }
+
+  /// When "ask for a folder every time" is enabled, show the directory picker
+  /// as soon as the confirmation page appears.
+  Future<void> _promptDestinationIfNeeded() async {
+    if (_didPromptDestination || !mounted) {
+      return;
+    }
+    _didPromptDestination = true;
+    final ref = context.ref;
+    if (ref.read(settingsProvider).autoSaveToDestination) {
+      return;
+    }
+    final directory = await pickDirectoryPath();
+    if (directory == null || directory.isEmpty || !mounted) {
+      return;
+    }
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      await persistDestinationFolderAccessIos(directory);
+    }
+    ref.notifier(serverProvider).setSessionDestinationDir(directory);
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final vm = widget.vm;
     final ref = context.ref;
     final receiveSession = ref.watch(serverProvider.select((s) => s?.session));
     if (receiveSession == null) {
@@ -46,13 +86,16 @@ class ReceiveOptionsPage extends StatelessWidget {
                 Row(
                   children: [
                     Text(t.receiveOptionsPage.destination, style: Theme.of(context).textTheme.titleLarge),
-                    if (checkPlatformWithFileSystem())
+                    if (checkPlatformCanChangeDestination())
                       Padding(
                         padding: const EdgeInsets.only(left: 10),
                         child: CustomIconButton(
                           onPressed: () async {
                             final directory = await pickDirectoryPath();
-                            if (directory != null) {
+                            if (directory != null && directory.isNotEmpty) {
+                              if (defaultTargetPlatform == TargetPlatform.iOS) {
+                                await persistDestinationFolderAccessIos(directory);
+                              }
                               ref.notifier(serverProvider).setSessionDestinationDir(directory);
                             }
                           },
@@ -62,7 +105,7 @@ class ReceiveOptionsPage extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 5),
-                Text(checkPlatformWithFileSystem() ? receiveSession.destinationDirectory : t.receiveOptionsPage.appDirectory),
+                Text(checkPlatformCanChangeDestination() ? receiveSession.destinationDirectory : t.receiveOptionsPage.appDirectory),
                 if (checkPlatformWithGallery())
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,

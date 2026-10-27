@@ -139,12 +139,22 @@ impl LsHttpClient {
         progress: impl Fn(u64) + Send + 'static,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), ClientError> {
-        let body = upload_body(content, progress);
+        // Resume (protocol extension): the offer is taken from the client
+        // state filled by prepare_upload, so the number of bytes skipped in the
+        // body and the offset quoted to the receiver always agree.
+        let resume = match self {
+            LsHttpClient::V2(client) => client.take_resume_offer(file_id),
+            LsHttpClient::V3(_) => None,
+        };
+        let skip = resume.as_ref().map_or(0, |offer| offer.offset);
+
+        let body = upload_body(content, progress, skip);
         match self {
             LsHttpClient::V2(client) => {
                 client
                     .upload(
-                        protocol, ip, port, public_key, session_id, file_id, token, body, cancel,
+                        protocol, ip, port, public_key, session_id, file_id, token, body, resume,
+                        cancel,
                     )
                     .await
             }
@@ -181,13 +191,37 @@ impl LsHttpClient {
 pub(super) fn upload_body(
     content: model::transfer::FileContent,
     progress: impl Fn(u64) + Send + 'static,
+    skip: u64,
 ) -> reqwest::Body {
-    let mut sent = 0_u64;
-    let stream = content.into_stream().map(move |chunk| {
-        let chunk = chunk?;
+    // `skip` is the number of bytes the receiver already holds (resume
+    // extension). Progress starts there so the reported fraction stays
+    // monotonic across an interruption instead of restarting at zero.
+    let mut sent = skip;
+    let mut remaining = skip;
+    let stream = content.into_stream().filter_map(move |chunk| {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            // The stream reports I/O failures as items; they have to reach the
+            // body unchanged, otherwise the request would end early and look
+            // successful to the receiver.
+            Err(error) => return Some(Err(anyhow::Error::from(error))),
+        };
+        if remaining > 0 {
+            let len = chunk.len() as u64;
+            if len <= remaining {
+                remaining -= len;
+                return None;
+            }
+            let drop = remaining as usize;
+            remaining = 0;
+            let rest = chunk.slice(drop..);
+            sent += rest.len() as u64;
+            progress(sent);
+            return Some(Ok::<Bytes, anyhow::Error>(rest));
+        }
         sent += chunk.len() as u64;
         progress(sent);
-        Ok::<Bytes, anyhow::Error>(chunk)
+        Some(Ok::<Bytes, anyhow::Error>(chunk))
     });
     reqwest::Body::wrap_stream(stream)
 }

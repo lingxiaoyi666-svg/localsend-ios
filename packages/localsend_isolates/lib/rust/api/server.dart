@@ -116,7 +116,12 @@ abstract class RsHttpServer implements RustOpaqueInterface {
   ///
   /// Passing the accepted file IDs (a subset of the offered files) accepts the request.
   /// Passing `None` declines the request.
-  Future<void> respondPrepareUpload({List<String>? acceptedFileIds});
+  ///
+  /// [resumeOffers] announces partial files that already exist on disk and may
+  /// be continued instead of restarted, one entry per file, formatted as
+  /// `"<fileId>\u{1f}<offset>\u{1f}<partialId>"`. Offers are forwarded unless
+  /// the sender asked for the plain v2.2 response with `?resume=0`.
+  Future<void> respondPrepareUpload({List<String>? acceptedFileIds, List<String>? resumeOffers});
 
   /// Stops the server.
   /// Returns after the listeners are closed, so the port can be bound again.

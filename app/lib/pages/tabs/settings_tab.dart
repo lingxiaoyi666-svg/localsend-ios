@@ -6,6 +6,7 @@ import 'package:localsend_app/model/persistence/color_mode.dart';
 import 'package:localsend_app/pages/about/about_page.dart';
 import 'package:localsend_app/pages/changelog_page.dart';
 import 'package:localsend_app/pages/donation/donation_page.dart';
+import 'package:localsend_app/pages/settings/network_diagnostics_page.dart';
 import 'package:localsend_app/pages/settings/network_interfaces_page.dart';
 import 'package:localsend_app/pages/tabs/settings_tab_controller.dart';
 import 'package:localsend_app/provider/network/server/server_provider.dart';
@@ -15,6 +16,7 @@ import 'package:localsend_app/util/alias_generator.dart';
 import 'package:localsend_app/util/device_type_ext.dart';
 import 'package:localsend_app/util/i18n.dart';
 import 'package:localsend_app/util/native/device_info_helper.dart';
+import 'package:localsend_app/util/native/ios_channel.dart';
 import 'package:localsend_app/util/native/macos_channel.dart';
 import 'package:localsend_app/util/native/pick_directory_path.dart';
 import 'package:localsend_app/util/native/platform_check.dart';
@@ -215,7 +217,7 @@ class SettingsTab extends StatelessWidget {
                     }
                   },
                 ),
-                if (checkPlatformWithFileSystem())
+                if (checkPlatformCanChangeDestination())
                   _SettingsEntry(
                     label: t.settingsTab.receive.destination,
                     child: TextButton(
@@ -229,6 +231,8 @@ class SettingsTab extends StatelessWidget {
                           await ref.notifier(settingsProvider).setDestination(null);
                           if (defaultTargetPlatform == TargetPlatform.macOS) {
                             await removeExistingDestinationAccess();
+                          } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+                            await removeExistingDestinationAccessIos();
                           }
                           return;
                         }
@@ -237,6 +241,8 @@ class SettingsTab extends StatelessWidget {
                         if (directory != null) {
                           if (defaultTargetPlatform == TargetPlatform.macOS) {
                             await persistDestinationFolderAccess(directory);
+                          } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+                            await persistDestinationFolderAccessIos(directory);
                           }
                           await ref.notifier(settingsProvider).setDestination(directory);
                         }
@@ -245,6 +251,34 @@ class SettingsTab extends StatelessWidget {
                         padding: const EdgeInsets.symmetric(vertical: 5),
                         child: Text(vm.settings.destination ?? t.settingsTab.receive.downloads, style: Theme.of(context).textTheme.titleMedium),
                       ),
+                    ),
+                  ),
+                if (checkPlatformCanChangeDestination())
+                  _BooleanEntry(
+                    label: _lsText(context, zh: '自动保存到默认目录', en: 'Auto save to default folder'),
+                    description: _lsText(
+                      context,
+                      zh: '开启：接收完成后直接存到上面的目录，不弹框。关闭：每次接收完成都弹文件夹选择框。',
+                      en: 'On: save into the folder above without asking. Off: ask for a folder after every incoming transfer.',
+                    ),
+                    value: vm.settings.autoSaveToDestination,
+                    onChanged: (b) async {
+                      await ref.notifier(settingsProvider).setAutoSaveToDestination(b);
+                    },
+                  ),
+                if (checkPlatformCanChangeDestination())
+                  _SettingsEntry(
+                    label: _lsText(context, zh: '收藏设备自动接收的文件类型', en: 'Auto-accepted file types from favorites'),
+                    description: _lsText(
+                      context,
+                      zh: '逗号分隔，例如 pdf,zip,jpg。留空 = 收藏设备发来的全部类型都不弹确认。仅对「收藏的设备」生效。',
+                      en: 'Comma separated, e.g. pdf,zip,jpg. Empty = accept every type from favorites. Applies to favorites only.',
+                    ),
+                    child: _AutoAcceptExtensionsField(
+                      initialValue: vm.settings.autoAcceptExtensions,
+                      onChanged: (s) async {
+                        await ref.notifier(settingsProvider).setAutoAcceptExtensions(s);
+                      },
                     ),
                   ),
                 if (checkPlatformWithGallery())
@@ -459,6 +493,13 @@ class SettingsTab extends StatelessWidget {
                       await context.push(() => const NetworkInterfacesPage());
                     },
                   ),
+                _ButtonEntry(
+                  label: _lsText(context, zh: '网络自检', en: 'Network self check'),
+                  buttonLabel: _lsText(context, zh: '检查', en: 'Check'),
+                  onTap: () async {
+                    await context.push(() => const NetworkDiagnosticsPage());
+                  },
+                ),
                 if (vm.advanced)
                   _SettingsEntry(
                     label: t.settingsTab.network.discoveryTimeout,
@@ -791,5 +832,43 @@ extension on ColorMode {
       ColorMode.yaru => 'Yaru',
       ColorMode.custom => t.settingsTab.general.colorOptions.custom,
     };
+  }
+}
+
+/// Minimal inline translation for the custom settings, so that the generated
+/// slang files do not have to be regenerated for every new string.
+String _lsText(BuildContext context, {required String zh, required String en}) {
+  final languageCode = Localizations.localeOf(context).languageCode;
+  return languageCode == 'zh' ? zh : en;
+}
+
+class _AutoAcceptExtensionsField extends StatefulWidget {
+  final String initialValue;
+  final ValueChanged<String> onChanged;
+
+  const _AutoAcceptExtensionsField({required this.initialValue, required this.onChanged});
+
+  @override
+  State<_AutoAcceptExtensionsField> createState() => _AutoAcceptExtensionsFieldState();
+}
+
+class _AutoAcceptExtensionsFieldState extends State<_AutoAcceptExtensionsField> {
+  late final TextEditingController _controller = TextEditingController(text: widget.initialValue);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TextFieldTv(
+      name: 'autoAcceptExtensions',
+      controller: _controller,
+      onChanged: (s) async {
+        widget.onChanged(s.trim());
+      },
+    );
   }
 }

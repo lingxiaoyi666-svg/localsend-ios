@@ -49,8 +49,19 @@ class HttpServerService {
 
   /// Answers a pending prepare-upload request.
   /// [acceptedFileIds] is the subset of the offered files to accept; `null` declines the request.
-  Future<void> respondPrepareUpload({required List<String>? acceptedFileIds}) async {
-    await _requireServer().respondPrepareUpload(acceptedFileIds: acceptedFileIds);
+  ///
+  /// [resumeOffers] announces partial files that may be continued instead of
+  /// restarted, one entry per file, formatted as
+  /// `"<fileId>\u{1f}<offset>\u{1f}<partialId>"`. Offers are forwarded unless
+  /// the sender asked for the plain v2.2 response with `?resume=0`.
+  Future<void> respondPrepareUpload({
+    required List<String>? acceptedFileIds,
+    List<String>? resumeOffers,
+  }) async {
+    await _requireServer().respondPrepareUpload(
+      acceptedFileIds: acceptedFileIds,
+      resumeOffers: resumeOffers,
+    );
   }
 
   /// Answers a pending file upload with the target the file should be saved to

@@ -23,6 +23,8 @@ import 'package:localsend_app/provider/selection/selected_receiving_files_provid
 import 'package:localsend_app/provider/selection/selected_sending_files_provider.dart';
 import 'package:localsend_app/provider/settings_provider.dart';
 import 'package:localsend_app/util/native/directories.dart';
+import 'package:localsend_app/util/native/ios_channel.dart';
+import 'package:localsend_app/util/native/pick_directory_path.dart';
 import 'package:localsend_app/util/native/platform_check.dart';
 import 'package:localsend_app/util/native/tray_helper.dart';
 import 'package:localsend_app/widget/dialogs/open_file_dialog.dart';
@@ -128,10 +130,12 @@ class ReceiveController {
 
     bool quickSave = settings.quickSave && server.getState().session?.message == null;
     final quickSaveFromFavorites = settings.quickSaveFromFavorites && server.getState().session?.message == null;
+    bool autoAcceptedFromFavorite = false;
     if (quickSaveFromFavorites) {
       final bool isFavorite = server.ref.read(favoritesProvider).any((e) => e.fingerprint == senderFingerprint);
       if (isFavorite) {
         quickSave = true;
+        autoAcceptedFromFavorite = true;
       }
     }
     if (server.getState().webUpload && settings.receiveViaLinkAutoAccept && server.getState().session?.message == null) {
@@ -139,7 +143,36 @@ class ReceiveController {
       quickSave = true;
     }
 
+    // Optional extension filter for favorite senders. When a list is configured,
+    // the transfer is only accepted silently if EVERY file matches, otherwise the
+    // normal confirmation page is shown so that the user can still pick.
+    if (autoAcceptedFromFavorite && settings.autoAcceptExtensions.trim().isNotEmpty) {
+      final allowedExtensions = settings.autoAcceptExtensions
+          .split(',')
+          .map((e) => e.trim().toLowerCase())
+          .map((e) => e.startsWith('.') ? e.substring(1) : e)
+          .where((e) => e.isNotEmpty)
+          .toSet();
+      final allMatch = files.values.every((f) => allowedExtensions.contains(_extensionOfFileName(f.fileName)));
+      if (!allMatch) {
+        quickSave = false;
+      }
+    }
+
     if (quickSave) {
+      if (!settings.autoSaveToDestination) {
+        // "Ask for a folder every time" mode: the destination has to be known
+        // BEFORE the transfer starts, otherwise the files are already written
+        // into the default folder. Cancelling falls back to the default folder.
+        final pickedDirectory = await pickDirectoryPath();
+        if (pickedDirectory != null && pickedDirectory.isNotEmpty) {
+          if (defaultTargetPlatform == TargetPlatform.iOS) {
+            await persistDestinationFolderAccessIos(pickedDirectory);
+          }
+          setSessionDestinationDir(pickedDirectory);
+        }
+      }
+
       // Push before accepting: the permission request in [acceptFileRequest] may block for a while.
       // ignore: use_build_context_synchronously, unawaited_futures
       Routerino.context.pushImmediately(
@@ -740,4 +773,14 @@ extension on ReceiveSessionState {
         ),
     );
   }
+}
+
+/// Lower-case file extension without the leading dot. Returns an empty string
+/// when the file name has no extension.
+String _extensionOfFileName(String fileName) {
+  final index = fileName.lastIndexOf('.');
+  if (index <= 0 || index == fileName.length - 1) {
+    return '';
+  }
+  return fileName.substring(index + 1).toLowerCase();
 }

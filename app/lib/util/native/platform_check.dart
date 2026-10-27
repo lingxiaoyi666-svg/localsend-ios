@@ -55,6 +55,13 @@ bool checkPlatformWithFileSystem() {
   return checkPlatform([TargetPlatform.linux, TargetPlatform.windows, TargetPlatform.android, TargetPlatform.macOS]);
 }
 
+/// This platform lets the user pick the folder that receives the files.
+/// iOS is included: the folder is chosen with UIDocumentPicker and persisted as
+/// a security scoped bookmark (see ios/Runner/AppDelegate.swift).
+bool checkPlatformCanChangeDestination() {
+  return checkPlatform([TargetPlatform.linux, TargetPlatform.windows, TargetPlatform.android, TargetPlatform.macOS, TargetPlatform.iOS]);
+}
+
 /// Convenience function to check if the app is not running on a Linux device with the Wayland display manager
 bool checkPlatformIsNotWaylandDesktop() {
   return !checkPlatform([TargetPlatform.linux]) || !_isWayland;

@@ -164,6 +164,18 @@ class SettingsStateMapper extends ClassMapperBase<SettingsState> {
     'verifyChecksums',
     _$verifyChecksums,
   );
+  static bool _$autoSaveToDestination(SettingsState v) =>
+      v.autoSaveToDestination;
+  static const Field<SettingsState, bool> _f$autoSaveToDestination = Field(
+    'autoSaveToDestination',
+    _$autoSaveToDestination,
+  );
+  static String _$autoAcceptExtensions(SettingsState v) =>
+      v.autoAcceptExtensions;
+  static const Field<SettingsState, String> _f$autoAcceptExtensions = Field(
+    'autoAcceptExtensions',
+    _$autoAcceptExtensions,
+  );
   static int _$discoveryTimeout(SettingsState v) => v.discoveryTimeout;
   static const Field<SettingsState, int> _f$discoveryTimeout = Field(
     'discoveryTimeout',
@@ -206,6 +218,8 @@ class SettingsStateMapper extends ClassMapperBase<SettingsState> {
     #receiveViaLinkAutoAccept: _f$receiveViaLinkAutoAccept,
     #createChecksums: _f$createChecksums,
     #verifyChecksums: _f$verifyChecksums,
+    #autoSaveToDestination: _f$autoSaveToDestination,
+    #autoAcceptExtensions: _f$autoAcceptExtensions,
     #discoveryTimeout: _f$discoveryTimeout,
     #advancedSettings: _f$advancedSettings,
   };
@@ -241,6 +255,8 @@ class SettingsStateMapper extends ClassMapperBase<SettingsState> {
       receiveViaLinkAutoAccept: data.dec(_f$receiveViaLinkAutoAccept),
       createChecksums: data.dec(_f$createChecksums),
       verifyChecksums: data.dec(_f$verifyChecksums),
+      autoSaveToDestination: data.dec(_f$autoSaveToDestination),
+      autoAcceptExtensions: data.dec(_f$autoAcceptExtensions),
       discoveryTimeout: data.dec(_f$discoveryTimeout),
       advancedSettings: data.dec(_f$advancedSettings),
     );
@@ -342,6 +358,8 @@ abstract class SettingsStateCopyWith<$R, $In extends SettingsState, $Out>
     bool? receiveViaLinkAutoAccept,
     bool? createChecksums,
     bool? verifyChecksums,
+    bool? autoSaveToDestination,
+    String? autoAcceptExtensions,
     int? discoveryTimeout,
     bool? advancedSettings,
   });
@@ -405,6 +423,8 @@ class _SettingsStateCopyWithImpl<$R, $Out>
     bool? receiveViaLinkAutoAccept,
     bool? createChecksums,
     bool? verifyChecksums,
+    bool? autoSaveToDestination,
+    String? autoAcceptExtensions,
     int? discoveryTimeout,
     bool? advancedSettings,
   }) => $apply(
@@ -442,6 +462,10 @@ class _SettingsStateCopyWithImpl<$R, $Out>
         #receiveViaLinkAutoAccept: receiveViaLinkAutoAccept,
       if (createChecksums != null) #createChecksums: createChecksums,
       if (verifyChecksums != null) #verifyChecksums: verifyChecksums,
+      if (autoSaveToDestination != null)
+        #autoSaveToDestination: autoSaveToDestination,
+      if (autoAcceptExtensions != null)
+        #autoAcceptExtensions: autoAcceptExtensions,
       if (discoveryTimeout != null) #discoveryTimeout: discoveryTimeout,
       if (advancedSettings != null) #advancedSettings: advancedSettings,
     }),
@@ -489,6 +513,10 @@ class _SettingsStateCopyWithImpl<$R, $Out>
     ),
     createChecksums: data.get(#createChecksums, or: $value.createChecksums),
     verifyChecksums: data.get(#verifyChecksums, or: $value.verifyChecksums),
+    autoSaveToDestination:
+        data.get(#autoSaveToDestination, or: $value.autoSaveToDestination),
+    autoAcceptExtensions:
+        data.get(#autoAcceptExtensions, or: $value.autoAcceptExtensions),
     discoveryTimeout: data.get(#discoveryTimeout, or: $value.discoveryTimeout),
     advancedSettings: data.get(#advancedSettings, or: $value.advancedSettings),
   );

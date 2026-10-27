@@ -3,6 +3,7 @@ use crate::http::client::url::{ApiVersion, TargetUrl};
 use crate::http::dto_v2::{
     InfoResponseDtoV2, PrepareDownloadResponseDtoV2, PrepareUploadRequestDtoV2,
     PrepareUploadResponseDtoV2, PrepareUploadResultV2, RegisterDtoV2, RegisterResponseDtoV2,
+    ResumeOfferDtoV2,
 };
 use crate::model::discovery::ProtocolType;
 use futures_util::StreamExt;
@@ -13,6 +14,16 @@ use tokio_util::sync::CancellationToken;
 /// HTTP client for LocalSend Protocol v2.2.
 pub struct LsHttpClientV2 {
     client: reqwest::Client,
+
+    /// Resume offers the peer handed out for the current transfer session
+    /// (protocol extension), keyed by file ID.
+    ///
+    /// Filled by [`Self::prepare_upload`] from the `resume` field of the
+    /// response and consumed by [`Self::take_resume_offer`]: an offer is good
+    /// for exactly one upload. The map dies with the client, which the app
+    /// creates per transfer session, so a stale offer can never leak into an
+    /// unrelated transfer.
+    resume_offers: std::sync::Mutex<std::collections::HashMap<String, ResumeOfferDtoV2>>,
 }
 
 impl LsHttpClientV2 {
@@ -37,6 +48,7 @@ impl LsHttpClientV2 {
     ) -> Result<Self, ClientError> {
         Ok(Self {
             client: super::create_reqwest_client(private_key, cert, expected_fingerprint, timeout)?,
+            resume_offers: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -56,7 +68,10 @@ impl LsHttpClientV2 {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            resume_offers: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     /// Registers with another device for discovery.
@@ -156,9 +171,12 @@ impl LsHttpClientV2 {
         pin: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<PrepareUploadResultV2, ClientError> {
-        let pin_params: &[(&'static str, &str)] = match &pin {
-            Some(pin) => &[("pin", pin)],
-            None => &[],
+        // `resume=1` announces that this sender can continue an interrupted
+        // transfer (protocol extension). Receivers that do not know the flag
+        // ignore it and answer byte-identically to protocol v2.2.
+        let request_params: &[(&'static str, &str)] = match &pin {
+            Some(pin) => &[("pin", pin), ("resume", "1")],
+            None => &[("resume", "1")],
         };
         let url = TargetUrl {
             version: ApiVersion::V2,
@@ -166,9 +184,13 @@ impl LsHttpClientV2 {
             host: ip.to_string(),
             port,
             path: "/prepare-upload",
-            params: pin_params,
+            params: request_params,
         }
         .to_string();
+
+        // Offers only ever belong to the response to this request, so a
+        // previous session's offers must not survive a new prepare-upload.
+        self.resume_offers.lock().unwrap().clear();
 
         let send = self
             .client
@@ -201,10 +223,25 @@ impl LsHttpClientV2 {
 
         let body = res.json::<PrepareUploadResponseDtoV2>().await?;
 
+        {
+            let mut offers = self.resume_offers.lock().unwrap();
+            offers.clear();
+            offers.extend(body.resume.iter().map(|(id, offer)| (id.clone(), offer.clone())));
+        }
+
         Ok(PrepareUploadResultV2 {
             status_code: status.as_u16(),
             response: Some(body),
         })
+    }
+
+    /// Takes the resume offer for `file_id`, if the peer handed one out.
+    ///
+    /// The offer is removed from the client state, so re-sending a file after a
+    /// failed attempt falls back to a full upload instead of resuming against
+    /// an offset the receiver no longer tracks.
+    pub fn take_resume_offer(&self, file_id: &str) -> Option<ResumeOfferDtoV2> {
+        self.resume_offers.lock().unwrap().remove(file_id)
     }
 
     /// Uploads a file to the receiver.
@@ -222,6 +259,8 @@ impl LsHttpClientV2 {
     /// * `file_id` - File ID to upload
     /// * `token` - File-specific token from prepare_upload
     /// * `body` - The streaming request body carrying the file content
+    /// * `resume` - Resume offer for this file, if the peer offered one. The
+    ///   caller must already have skipped `resume.offset` bytes in `body`.
     /// * `cancel` - Cancellation token; cancelling it aborts the upload with [`ClientError::Cancelled`]
     ///
     /// # Errors
@@ -240,19 +279,32 @@ impl LsHttpClientV2 {
         file_id: &str,
         token: &str,
         body: reqwest::Body,
+        resume: Option<ResumeOfferDtoV2>,
         cancel: CancellationToken,
     ) -> Result<(), ClientError> {
+        let offset_value = resume.as_ref().map(|offer| offer.offset.to_string());
+        let mut params: Vec<(&str, &str)> = vec![
+            ("sessionId", session_id),
+            ("fileId", file_id),
+            ("token", token),
+        ];
+        // Protocol extension: the offset and the partial ID are always sent
+        // together, and the offset is exactly the number of bytes the caller
+        // skipped in the body. A receiver that does not know the parameters
+        // ignores them and appends, which is why they are only ever sent in
+        // response to an offer it made.
+        if let (Some(offer), Some(offset)) = (&resume, &offset_value) {
+            params.push(("offset", offset.as_str()));
+            params.push(("partialId", offer.partial_id.as_str()));
+        }
+
         let url = TargetUrl {
             version: ApiVersion::V2,
             protocol: protocol.as_str(),
             host: ip.to_string(),
             port,
             path: "/upload",
-            params: &[
-                ("sessionId", session_id),
-                ("fileId", file_id),
-                ("token", token),
-            ],
+            params: &params,
         }
         .to_string();
 
