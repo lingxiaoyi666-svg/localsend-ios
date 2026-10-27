@@ -196,32 +196,46 @@ pub(super) fn upload_body(
     // `skip` is the number of bytes the receiver already holds (resume
     // extension). Progress starts there so the reported fraction stays
     // monotonic across an interruption instead of restarting at zero.
-    let mut sent = skip;
-    let mut remaining = skip;
+    //
+    // The counter lives behind an `Arc<Mutex<_>>` because `StreamExt::filter_map`
+    // takes an async closure: the closure cannot keep `&mut` borrows across the
+    // returned future, so shared mutable state has to be handed over by clone.
+    let state = std::sync::Arc::new(std::sync::Mutex::new((skip, skip))); // (sent, remaining)
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(progress));
     let stream = content.into_stream().filter_map(move |chunk| {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            // The stream reports I/O failures as items; they have to reach the
-            // body unchanged, otherwise the request would end early and look
-            // successful to the receiver.
-            Err(error) => return Some(Err(anyhow::Error::from(error))),
-        };
-        if remaining > 0 {
-            let len = chunk.len() as u64;
-            if len <= remaining {
-                remaining -= len;
-                return None;
+        let state = std::sync::Arc::clone(&state);
+        let progress = std::sync::Arc::clone(&progress);
+        async move {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                // The stream reports I/O failures as items; they have to reach
+                // the body unchanged, otherwise the request would end early and
+                // look successful to the receiver.
+                Err(error) => return Some(Err(anyhow::Error::from(error))),
+            };
+            let mut guard = state.lock().unwrap();
+            let (sent, remaining) = &mut *guard;
+            if *remaining > 0 {
+                let len = chunk.len() as u64;
+                if len <= *remaining {
+                    *remaining -= len;
+                    return None;
+                }
+                let skip_bytes = *remaining as usize;
+                *remaining = 0;
+                let rest = chunk.slice(skip_bytes..);
+                *sent += rest.len() as u64;
+                let total = *sent;
+                drop(guard);
+                progress.lock().unwrap()(total);
+                return Some(Ok::<Bytes, anyhow::Error>(rest));
             }
-            let drop = remaining as usize;
-            remaining = 0;
-            let rest = chunk.slice(drop..);
-            sent += rest.len() as u64;
-            progress(sent);
-            return Some(Ok::<Bytes, anyhow::Error>(rest));
+            *sent += chunk.len() as u64;
+            let total = *sent;
+            drop(guard);
+            progress.lock().unwrap()(total);
+            Some(Ok::<Bytes, anyhow::Error>(chunk))
         }
-        sent += chunk.len() as u64;
-        progress(sent);
-        Some(Ok::<Bytes, anyhow::Error>(chunk))
     });
     reqwest::Body::wrap_stream(stream)
 }
